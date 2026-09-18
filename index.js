@@ -44,6 +44,9 @@ async function run() {
     const transactionsCollection = client
       .db("financeTracker_DB")
       .collection("transactionsDB");
+    const budgetsCollection = client
+      .db("financeTracker_DB")
+      .collection("budgetsDB");
 
     // --------------------=--------------------
     //      Users Database with API
@@ -101,7 +104,7 @@ async function run() {
       try {
         const email = req.query.email;
         let query = {};
-        
+
         if (email) {
           query = { "createdBy.email": email.trim() };
         }
@@ -172,11 +175,10 @@ async function run() {
       }
     });
 
-
-     // --------------------=--------------------
+    // --------------------=--------------------
     //      Categories Database with API
     //---------------------=-------------------
-     app.post("/categories", async (req, res) => {
+    app.post("/categories", async (req, res) => {
       try {
         const categoriesData = req.body;
         const result = await categoriesCollection.insertOne(categoriesData);
@@ -190,7 +192,7 @@ async function run() {
       try {
         const email = req.query.email;
         let query = {};
-        
+
         if (email) {
           query = { userEmail: email.trim() };
         }
@@ -201,47 +203,224 @@ async function run() {
       }
     });
 
-
-    
     // --------------------=--------------------
-    //      Cash in Database with API
+    //      Transactions Database with API
     //---------------------=-------------------
 
-    app.post("/transactions", async (req, res) => {
-      try{
+    // app.post("/transactions", async (req, res) => {
+    //   try {
+    //     const transactionData = req.body;
+    //     const result = await transactionsCollection.insertOne(transactionData);
+    //     res.send(result);
+    //   } catch (error) {
+    //     res.status(500).send({ error: "Failed to insert transaction" });
+    //   }
+    // });
+    // app.post("/transactions", async (req, res) => {
+    //   try {
+    //     const transactionData = req.body;
 
+    //     const result = await transactionsCollection.insertOne(transactionData);
+
+    //     // code for update balance in books
+    //     if (result.insertedId) {
+    //       const amount = parseFloat(transactionData.amount);
+    //       const bookId = transactionData.bookId;
+
+    //       // transaction type to update or modify
+    //       let bookUpdate = {};
+
+    //       if (transactionData.type === "CASH_IN") {
+    //         bookUpdate = {
+    //           $inc: {
+    //             currentBalance: amount,
+    //             totalIncome: amount,
+    //           },
+    //         };
+    //       } else if (transactionData.type === "CASH_OUT") {
+    //         bookUpdate = {
+    //           $inc: {
+    //             currentBalance: -amount,
+    //             totalExpense: amount,
+    //           },
+    //         };
+    //       }
+    //       // books update in DB
+    //       await booksCollection.updateOne(
+    //         { _id: new ObjectId(bookId) },
+    //         bookUpdate,
+    //       );
+    //     }
+
+    //     res.send(result);
+    //   } catch (error) {
+    //     res.status(500).send({ error: "Failed to insert transaction" });
+    //   }
+    // });
+    app.post("/transactions", async (req, res) => {
+      try {
         const transactionData = req.body;
         const result = await transactionsCollection.insertOne(transactionData);
-        res.send(result);
 
+        if (result.insertedId) {
+          const amount = parseFloat(transactionData.amount);
+
+          if (transactionData.type === "CASH_IN") {
+            await booksCollection.updateOne(
+              { _id: new ObjectId(transactionData.bookId) },
+              { $inc: { currentBalance: amount, totalIncome: amount } },
+            );
+          } else if (transactionData.type === "CASH_OUT") {
+            await booksCollection.updateOne(
+              { _id: new ObjectId(transactionData.bookId) },
+              { $inc: { currentBalance: -amount, totalExpense: amount } },
+            );
+          } else if (transactionData.type === "TRANSFER") {
+            const { sourceBookId, destinationBookId } =
+              transactionData.transferDetails;
+
+            // Source Book balance deduction
+            await booksCollection.updateOne(
+              { _id: new ObjectId(sourceBookId) },
+              { $inc: { currentBalance: -amount } },
+            );
+
+            // Destination Book balance addition
+            await booksCollection.updateOne(
+              { _id: new ObjectId(destinationBookId) },
+              { $inc: { currentBalance: amount } },
+            );
+          }
+        }
+
+        res.send(result);
       } catch (error) {
-         res.status(500).send({ error: "Failed to insert transaction" });
+        console.error("Transaction Creation Error:", error);
+        res.status(500).send({ error: "Failed to insert transaction" });
       }
-    })
+    });
 
     app.get("/transactions", async (req, res) => {
-      try{
-        const {email, type, bookId} = req.query;
+      try {
+        const { email, type, bookId } = req.query;
         let query = {};
-        
+
         if (email) {
           query = { userEmail: email.trim() };
         }
-        if(type) {
+        if (type) {
           query.type = type;
         }
-        if(bookId) {
-          query.bookId = bookId;
+        // Check both main bookId and destinationBookId inside transferDetails
+        if (bookId) {
+          // query.bookId = bookId;
+          query.$or = [
+            { bookId: bookId },
+            { "transferDetails.destinationBookId": bookId },
+          ];
         }
-        
-        const result = await categoriesCollection.find(query).sort({date: -1}).toArray();
-        res.send(result);
 
+        const result = await transactionsCollection
+          .find(query)
+          .sort({ date: -1 })
+          .toArray();
+        res.send(result);
       } catch (error) {
         res.status(500).send({ error: "Failed to fetch transactions" });
       }
-    })
+    });
 
+    // --------------------=--------------------
+    //      Budgets Database with API
+    //---------------------=-------------------
+
+    app.post("/budgets", async (req, res) => {
+      try {
+        const budgetData = req.body;
+
+        const result = await budgetsCollection.insertOne(budgetData);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to insert budget data" });
+      }
+    });
+    //  2. Get Budgets (filter by userEmail, bookId, category, month)
+    app.get("/budgets", async (req, res) => {
+      try {
+        const { email, bookId, category, month } = req.query;
+        let query = {};
+
+        if (email) {
+          query.userEmail = email.trim();
+        }
+        if (bookId) {
+          query.bookId = bookId;
+        }
+        if (category) {
+          query.category = category;
+        }
+        if (month) {
+          query.month = month; // Format example: "2026-03"
+        }
+
+        const result = await budgetsCollection.find(query).toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to fetch budgets" });
+      }
+    });
+
+    app.get("/budgets/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+        const budget = await budgetsCollection.findOne(query);
+
+        if (!budget) {
+          return res.status(404).send({ message: "Budget not found" });
+        }
+        res.send(budget);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to fetch budget" });
+      }
+    });
+
+    // 4. Update Budget by ID
+    app.patch("/budgets/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const filter = { _id: new ObjectId(id) };
+        const updatedData = req.body;
+
+        const updateDoc = {
+          $set: {
+            ...updatedData,
+            updatedAt: new Date(),
+          },
+        };
+
+        const result = await budgetsCollection.updateOne(filter, updateDoc);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to update budget" });
+      }
+    });
+
+    // 5. Delete Budget by ID
+    app.delete("/budgets/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+        const result = await budgetsCollection.deleteOne(query);
+
+        if (result.deletedCount === 0) {
+          return res.status(404).send({ message: "Budget not found" });
+        }
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to delete budget" });
+      }
+    });
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
