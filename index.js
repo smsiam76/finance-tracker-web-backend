@@ -321,14 +321,105 @@ async function run() {
         }
 
         const result = await transactionsCollection
-          .find(query)
-          .sort({ date: -1 })
-          .toArray();
+          .aggregate([
+            {$match: query},
+            { $sort: { date: -1 } },
+            // Safe Object ID conversion for Book
+            {
+          $addFields: {
+            convertedBookId: {
+              $cond: [
+                { $and: [{ $ne: ["$bookId", null] }, { $ne: ["$bookId", ""] }] },
+                { $toObjectId: "$bookId" },
+                null,
+              ],
+            },
+            convertedCategoryId: {
+              $cond: [
+                { $and: [{ $ne: ["$categoryId", null] }, { $ne: ["$categoryId", ""] }] },
+                { $toObjectId: "$categoryId" },
+                null,
+              ],
+            },
+          },
+        },
+        // Lookup Book Details
+        {
+          $lookup: {
+            from: "booksDB",
+            localField: "convertedBookId",
+            foreignField: "_id",
+            as: "bookDetails",
+          },
+        },
+        { $unwind: { path: "$bookDetails", preserveNullAndEmptyArrays: true } },
+        // Lookup Category Details
+        {
+          $lookup: {
+            from: "categoriesDB",
+            localField: "convertedCategoryId",
+            foreignField: "_id",
+            as: "categoryDetails",
+          },
+        },
+        { $unwind: { path: "$categoryDetails", preserveNullAndEmptyArrays: true } },
+        // Only Keep Required & Important Fields
+        {
+          $project: {
+            _id: 1,
+            amount: 1,
+            bookId: 1,
+            type: 1,
+            date: 1,
+            note: 1,
+            categoryId: 1,
+            userEmail: 1,
+            transferDetails: 1,
+            bookDetails: {
+              name: "$bookDetails.bookName",
+              icon: "$bookDetails.icon",
+              color: "$bookDetails.themeColor",
+            },
+
+          },
+        },
+      ])
+      .toArray();
+
         res.send(result);
       } catch (error) {
         res.status(500).send({ error: "Failed to fetch transactions" });
       }
     });
+    // app.get("/transactions", async (req, res) => {
+    //   try {
+    //     const { email, type, bookId } = req.query;
+    //     let query = {};
+
+    //     if (email) {
+    //       query = { userEmail: email.trim() };
+    //     }
+    //     if (type) {
+    //       query.type = type;
+    //     }
+    //     // Check both main bookId and destinationBookId inside transferDetails
+    //     if (bookId) {
+    //       // query.bookId = bookId;
+    //       query.$or = [
+    //         { bookId: bookId },
+    //         { "transferDetails.destinationBookId": bookId },
+    //       ];
+    //     }
+
+    //     const result = await transactionsCollection
+    //       .find(query)
+    //       .sort({ date: -1 })
+    //       .toArray();
+    //     res.send(result);
+    //   } catch (error) {
+    //     res.status(500).send({ error: "Failed to fetch transactions" });
+    //   }
+    // });
 
     // --------------------=--------------------
     //      Budgets Database with API
@@ -419,6 +510,250 @@ async function run() {
         res.send(result);
       } catch (error) {
         res.status(500).send({ error: "Failed to delete budget" });
+      }
+    });
+
+    // =----------------------------------------
+    // DASHBOARD SUMMARY API
+    // =----------------------------------------
+    app.get("/dashboard/summary", async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email)
+          return res
+            .status(400)
+            .send({ error: "Email query parameter is required" });
+        const userEmail = email.trim();
+
+        // Calculate Net Balance across all user books
+        const books = await booksCollection
+          .find({ "createdBy.email": userEmail })
+          .toArray();
+        const totalNetBalance = books.reduce(
+          (sum, book) => sum + (parseFloat(book.currentBalance) || 0),
+          0,
+        );
+
+        // Aggregate income and expense stats
+        const transactionStats = await transactionsCollection
+          .aggregate([
+            { $match: { userEmail: userEmail } },
+            {
+              $group: {
+                _id: "$type",
+                totalAmount: { $sum: { $toDouble: "$amount" } },
+              },
+            },
+          ])
+          .toArray();
+
+        let totalExpense = 0;
+        let totalIncome = 0;
+
+        transactionStats.forEach((stat) => {
+          if (stat._id === "CASH_OUT") totalExpense = stat.totalAmount;
+          if (stat._id === "CASH_IN") totalIncome = stat.totalAmount;
+        });
+
+        const netSavings = totalIncome - totalExpense;
+
+        // Categorized expenses
+        // Categorized expenses
+        const categoryExpenses = await transactionsCollection
+          .aggregate([
+            {
+              $match: {
+                userEmail: userEmail,
+                type: "CASH_OUT",
+                categoryId: { $ne: null, $exists: true },
+              },
+            },
+            {
+              $addFields: {
+                // String categoryId কে ObjectId তে রূপান্তর
+                convertedCategoryId: { $toObjectId: "$categoryId" },
+              },
+            },
+            {
+              $lookup: {
+                from: "categoriesDB",
+                localField: "convertedCategoryId",
+                foreignField: "_id",
+                as: "categoryDetails",
+              },
+            },
+            { $unwind: "$categoryDetails" },
+            {
+              $group: {
+                _id: "$categoryDetails.name",
+                amount: { $sum: { $toDouble: "$amount" } },
+                color: { $first: "$categoryDetails.color" },
+              },
+            },
+            {
+              $project: {
+                name: "$_id",
+                category: "$_id",
+                amount: 1,
+                color: 1,
+                _id: 0,
+              },
+            },
+          ])
+          .toArray();
+
+        // Total budgeted calculation
+        const budgets = await budgetsCollection
+          .find({ userEmail: userEmail })
+          .toArray();
+        const totalBudgeted = budgets.reduce(
+          (sum, b) => sum + (parseFloat(b.budgetAmount) || 0),
+          0,
+        );
+
+        res.send({
+          metrics: {
+            totalNetBalance,
+            totalBudgeted,
+            totalExpense,
+            netSavings,
+          },
+          categoryExpenses,
+        });
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ error: "Failed to load dashboard summary" });
+      }
+    });
+
+    // =----------------------------------------
+    // BUDGET VS EXPENSE OVERVIEW API (Optimized Aggregation)
+    // =----------------------------------------
+    // app.get("/dashboard/budget-overview", async (req, res) => {
+    //   try {
+    //     const { email } = req.query;
+    //     if (!email) return res.status(400).send({ error: "Email is required" });
+    //     const userEmail = email.trim();
+
+    //     const budgetOverview = await budgetsCollection
+    //       .aggregate([
+    //         { $match: { userEmail } },
+    //         {
+    //           $lookup: {
+    //             from: "transactionsDB",
+    //             let: { catName: "$category", userEmail: "$userEmail" },
+    //             pipeline: [
+    //               {
+    //                 $match: {
+    //                   $expr: {
+    //                     $and: [
+    //                       { $eq: ["$userEmail", "$$userEmail"] },
+    //                       { $eq: ["$type", "CASH_OUT"] },
+    //                       { $eq: ["$category", "$$catName"] },
+    //                     ],
+    //                   },
+    //                 },
+    //               },
+    //               {
+    //                 $group: {
+    //                   _id: null,
+    //                   totalSpent: { $sum: { $toDouble: "$amount" } },
+    //                 },
+    //               },
+    //             ],
+    //             as: "spentData",
+    //           },
+    //         },
+    //         {
+    //           $project: {
+    //             _id: 1,
+    //             name: "$category",
+    //             spent: {
+    //               $ifNull: [{ $arrayElemAt: ["$spentData.totalSpent", 0] }, 0],
+    //             },
+    //             total: { $toDouble: { $ifNull: ["$budgetAmount", 0] } },
+    //           },
+    //         },
+    //       ])
+    //       .toArray();
+
+    //     res.send(budgetOverview);
+    //   } catch (error) {
+    //     console.error(error);
+    //     res.status(500).send({ error: "Failed to calculate budget overview" });
+    //   }
+    // });
+
+    app.get("/dashboard/budget-overview", async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) return res.status(400).send({ error: "Email is required" });
+        const userEmail = email.trim();
+
+        const budgetOverview = await budgetsCollection
+          .aggregate([
+            { $match: { userEmail } },
+            {
+              $lookup: {
+                from: "transactionsDB",
+                let: { catName: "$category", userEmail: "$userEmail" },
+                pipeline: [
+                  {
+                    $match: {
+                      $expr: {
+                        $and: [
+                          { $eq: ["$userEmail", "$$userEmail"] },
+                          { $eq: ["$type", "CASH_OUT"] },
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    $addFields: {
+                      convertedCategoryId: { $toObjectId: "$categoryId" },
+                    },
+                  },
+                  {
+                    $lookup: {
+                      from: "categoriesDB",
+                      localField: "convertedCategoryId",
+                      foreignField: "_id",
+                      as: "cat",
+                    },
+                  },
+                  { $unwind: "$cat" },
+                  {
+                    $match: {
+                      $expr: { $eq: ["$cat.name", "$$catName"] },
+                    },
+                  },
+                  {
+                    $group: {
+                      _id: null,
+                      totalSpent: { $sum: { $toDouble: "$amount" } },
+                    },
+                  },
+                ],
+                as: "spentData",
+              },
+            },
+            {
+              $project: {
+                _id: 1,
+                name: "$category",
+                spent: {
+                  $ifNull: [{ $arrayElemAt: ["$spentData.totalSpent", 0] }, 0],
+                },
+                total: { $toDouble: { $ifNull: ["$budgetAmount", 0] } },
+              },
+            },
+          ])
+          .toArray();
+
+        res.send(budgetOverview);
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ error: "Failed to calculate budget overview" });
       }
     });
 
