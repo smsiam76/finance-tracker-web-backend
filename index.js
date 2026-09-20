@@ -47,6 +47,9 @@ async function run() {
     const budgetsCollection = client
       .db("financeTracker_DB")
       .collection("budgetsDB");
+    const debtsCollection = client
+      .db("financeTracker_DB")
+      .collection("debtsDB");
 
     // --------------------=--------------------
     //      Users Database with API
@@ -191,7 +194,7 @@ async function run() {
     app.get("/categories", async (req, res) => {
       try {
         const email = req.query.email;
-        let query = {};
+        let query = { $or: [{ isDefault: true }, { userEmail: email }] };
 
         if (email) {
           query = { userEmail: email.trim() };
@@ -322,69 +325,88 @@ async function run() {
 
         const result = await transactionsCollection
           .aggregate([
-            {$match: query},
+            { $match: query },
             { $sort: { date: -1 } },
             // Safe Object ID conversion for Book
             {
-          $addFields: {
-            convertedBookId: {
-              $cond: [
-                { $and: [{ $ne: ["$bookId", null] }, { $ne: ["$bookId", ""] }] },
-                { $toObjectId: "$bookId" },
-                null,
-              ],
+              $addFields: {
+                convertedBookId: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $ne: ["$bookId", null] },
+                        { $ne: ["$bookId", ""] },
+                      ],
+                    },
+                    { $toObjectId: "$bookId" },
+                    null,
+                  ],
+                },
+                convertedCategoryId: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $ne: ["$categoryId", null] },
+                        { $ne: ["$categoryId", ""] },
+                      ],
+                    },
+                    { $toObjectId: "$categoryId" },
+                    null,
+                  ],
+                },
+              },
             },
-            convertedCategoryId: {
-              $cond: [
-                { $and: [{ $ne: ["$categoryId", null] }, { $ne: ["$categoryId", ""] }] },
-                { $toObjectId: "$categoryId" },
-                null,
-              ],
+            // Lookup Book Details
+            {
+              $lookup: {
+                from: "booksDB",
+                localField: "convertedBookId",
+                foreignField: "_id",
+                as: "bookDetails",
+              },
             },
-          },
-        },
-        // Lookup Book Details
-        {
-          $lookup: {
-            from: "booksDB",
-            localField: "convertedBookId",
-            foreignField: "_id",
-            as: "bookDetails",
-          },
-        },
-        { $unwind: { path: "$bookDetails", preserveNullAndEmptyArrays: true } },
-        // Lookup Category Details
-        {
-          $lookup: {
-            from: "categoriesDB",
-            localField: "convertedCategoryId",
-            foreignField: "_id",
-            as: "categoryDetails",
-          },
-        },
-        { $unwind: { path: "$categoryDetails", preserveNullAndEmptyArrays: true } },
-        // Only Keep Required & Important Fields
-        {
-          $project: {
-            _id: 1,
-            amount: 1,
-            bookId: 1,
-            type: 1,
-            date: 1,
-            note: 1,
-            categoryId: 1,
-            userEmail: 1,
-            transferDetails: 1,
-            bookDetails: {
-              name: "$bookDetails.bookName",
-              icon: "$bookDetails.icon",
-              color: "$bookDetails.themeColor",
+            {
+              $unwind: {
+                path: "$bookDetails",
+                preserveNullAndEmptyArrays: true,
+              },
             },
-
-          },
-        },
-      ])
-      .toArray();
+            // Lookup Category Details
+            {
+              $lookup: {
+                from: "categoriesDB",
+                localField: "convertedCategoryId",
+                foreignField: "_id",
+                as: "categoryDetails",
+              },
+            },
+            {
+              $unwind: {
+                path: "$categoryDetails",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            // Only Keep Required & Important Fields
+            {
+              $project: {
+                _id: 1,
+                amount: 1,
+                bookId: 1,
+                type: 1,
+                date: 1,
+                note: 1,
+                categoryId: 1,
+                userEmail: 1,
+                transferDetails: 1,
+                bookDetails: {
+                  name: "$bookDetails.bookName",
+                  icon: "$bookDetails.icon",
+                  color: "$bookDetails.themeColor",
+                },
+              },
+            },
+          ])
+          .toArray();
 
         res.send(result);
       } catch (error) {
@@ -757,6 +779,283 @@ async function run() {
       }
     });
 
+    // --------------------=--------------------
+    //      Reports Database with API
+    // --------------------=--------------------
+
+    // Get Analytics Data filtered by Period (Daily, Weekly, Monthly, Yearly)
+    app.get("/reports/analytics", async (req, res) => {
+      try {
+        const { email, period = "Monthly" } = req.query;
+
+        if (!email) {
+          return res.status(400).send({ error: "Email is required" });
+        }
+
+        const userEmail = email.trim();
+        const currentDate = new Date();
+        let startDate = new Date();
+
+        // Date range setup according to period filter
+        if (period === "Daily") {
+          startDate.setHours(0, 0, 0, 0);
+        } else if (period === "Weekly") {
+          startDate.setDate(currentDate.getDate() - 7);
+        } else if (period === "Monthly") {
+          startDate.setMonth(currentDate.getMonth() - 1);
+        } else if (period === "Yearly") {
+          startDate.setFullYear(currentDate.getFullYear() - 1);
+        }
+
+        // Match query for transactions within date range
+        const matchQuery = {
+          userEmail,
+          date: { $gte: startDate.toISOString() },
+        };
+
+        // Calculate total income and total expense for selected period
+        const stats = await transactionsCollection
+          .aggregate([
+            { $match: matchQuery },
+            {
+              $group: {
+                _id: "$type",
+                total: { $sum: { $toDouble: "$amount" } },
+              },
+            },
+          ])
+          .toArray();
+
+        let totalIncome = 0;
+        let totalExpense = 0;
+
+        stats.forEach((item) => {
+          if (item._id === "CASH_IN") totalIncome = item.total;
+          if (item._id === "CASH_OUT") totalExpense = item.total;
+        });
+
+        const currentBalance = totalIncome - totalExpense;
+
+        // Balance Trend over time for Chart
+        const balanceTrend = await transactionsCollection
+          .aggregate([
+            { $match: matchQuery },
+            {
+              $group: {
+                _id: { $substr: ["$date", 0, 10] }, // Format: YYYY-MM-DD
+                totalIncome: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ["$type", "CASH_IN"] },
+                      { $toDouble: "$amount" },
+                      0,
+                    ],
+                  },
+                },
+                totalExpense: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ["$type", "CASH_OUT"] },
+                      { $toDouble: "$amount" },
+                      0,
+                    ],
+                  },
+                },
+              },
+            },
+            { $sort: { _id: 1 } },
+            {
+              $project: {
+                _id: 0,
+                time: "$_id",
+                balance: { $subtract: ["$totalIncome", "$totalExpense"] },
+              },
+            },
+          ])
+          .toArray();
+
+        // Expenses grouped by Category for Pie Chart (UPDATED HERE)
+        const categories = await transactionsCollection
+          .aggregate([
+            {
+              $match: {
+                userEmail,
+                type: "CASH_OUT",
+                date: { $gte: startDate.toISOString() },
+                categoryId: { $ne: null, $exists: true, $ne: "" },
+              },
+            },
+            {
+              $addFields: {
+                convertedCategoryId: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $ne: ["$categoryId", null] },
+                        { $ne: ["$categoryId", ""] },
+                      ],
+                    },
+                    { $toObjectId: "$categoryId" },
+                    null,
+                  ],
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "categoriesDB",
+                localField: "convertedCategoryId",
+                foreignField: "_id",
+                as: "cat",
+              },
+            },
+            { $unwind: { path: "$cat", preserveNullAndEmptyArrays: false } },
+            {
+              $group: {
+                _id: "$cat.name",
+                value: { $sum: { $toDouble: "$amount" } },
+                color: { $first: "$cat.color" },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                name: "$_id",
+                category: "$_id",
+                value: 1,
+                color: 1,
+              },
+            },
+          ])
+          .toArray();
+
+        res.send({
+          totalIncome,
+          totalExpense,
+          currentBalance,
+          incomeGrowth: "+12.5%",
+          expenseGrowth: "-4.2%",
+          balanceTrend,
+          categories,
+        });
+      } catch (error) {
+        console.error("Reports API Error:", error);
+        res.status(500).send({ error: "Failed to fetch report analytics" });
+      }
+    });
+    // 2. Get Overall Lifetime Metrics
+    app.get("/reports/overall", async (req, res) => {
+      try {
+        const { email } = req.query;
+
+        if (!email) {
+          return res.status(400).send({ error: "Email is required" });
+        }
+
+        const userEmail = email.trim();
+
+        const overallStats = await transactionsCollection
+          .aggregate([
+            { $match: { userEmail } },
+            {
+              $group: {
+                _id: "$type",
+                totalAmount: { $sum: { $toDouble: "$amount" } },
+                totalCount: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray();
+
+        res.send(overallStats);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to fetch overall analytics" });
+      }
+    });
+
+    // --------------------=--------------------
+    //      Lent and Borrowed Database with API
+    // --------------------=--------------------
+    app.post("/debts", async (req, res) => {
+      try {
+        const debtData = req.body;
+
+        const result = await debtsCollection.insertOne(debtData);
+
+        res.send(result);
+      } catch (error) {
+        console.error("Create Debt Error:", error);
+        res.status(500).send({ error: "Failed to create debt record" });
+      }
+    });
+    // Get All Debts (Filter by email/userId, type, status, or bookId)
+    app.get("/debts", async (req, res) => {
+      try {
+        const { email, userId, type, status, bookId } = req.query;
+        let query = {};
+
+        if (email) query.userEmail = email.trim();
+        if (userId) query.userId = userId;
+        if (type) query.type = type;
+        if (status) query.status = status;
+        if (bookId) query.bookId = bookId;
+
+        const result = await debtsCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to fetch debt records" });
+      }
+    });
+
+    app.patch("/debts/settle/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { amount, note } = req.body;
+        const filter = { _id: new ObjectId(id) };
+
+        const debt = await debtsCollection.findOne(filter);
+        if (!debt) {
+          return res.status(404).send({ error: "Debt record not found" });
+        }
+
+        const currentBalance = Number(debt.remainingBalance) || 0;
+        const paymentAmount = Number(amount) || currentBalance;
+        const newRemainingBalance = Math.max(0, currentBalance - paymentAmount);
+
+        // Status update: balance 0 hole 'PAID', na hole 'PARTIAL'
+        const newStatus = newRemainingBalance === 0 ? "PAID" : "PARTIAL";
+
+        const updateDoc = {
+          $set: {
+            remainingBalance: newRemainingBalance,
+            status: newStatus,
+            updatedAt: new Date(),
+          },
+          $push: {
+            settlements: {
+              amount: paymentAmount,
+              note: note || "Settlement Payment",
+              date: new Date(),
+            },
+          },
+        };
+
+        const result = await debtsCollection.updateOne(filter, updateDoc);
+        res.send({
+          success: true,
+          result,
+          remainingBalance: newRemainingBalance,
+          status: newStatus,
+        });
+      } catch (error) {
+        console.error("Settle Debt Error:", error);
+        res.status(500).send({ error: "Failed to settle debt record" });
+      }
+    });
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
@@ -767,6 +1066,7 @@ async function run() {
     // await client.close();
   }
 }
+
 run().catch(console.dir);
 
 app.get("/", (req, res) => {
