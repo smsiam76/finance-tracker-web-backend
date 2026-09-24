@@ -41,6 +41,9 @@ async function run() {
     const categoriesCollection = client
       .db("financeTracker_DB")
       .collection("categoriesDB");
+    const remindersCollection = client
+      .db("financeTracker_DB")
+      .collection("remindersDB");
     const transactionsCollection = client
       .db("financeTracker_DB")
       .collection("transactionsDB");
@@ -98,6 +101,178 @@ async function run() {
       }
     });
 
+    // Get Logged-in User Profile
+    app.get("/users/profile", async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (!email) return res.status(400).send({ error: "Email is required" });
+
+        const user = await usersCollection.findOne({ email: email.trim() });
+        if (!user) return res.status(404).send({ message: "User not found" });
+
+        res.send(user);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to fetch user profile" });
+      }
+    });
+
+    // Update User Profile (Phone, Location, FullName)
+    app.patch("/users/profile", async (req, res) => {
+      try {
+        const { email, fullName, phone, location } = req.body;
+        if (!email) return res.status(400).send({ error: "Email is required" });
+
+        const filter = { email: email.trim() };
+        const updateDoc = {
+          $set: {
+            ...(fullName && { fullName }),
+            ...(phone && { phone }),
+            ...(location && { location }),
+            updatedAt: new Date(),
+          },
+        };
+
+        const result = await usersCollection.updateOne(filter, updateDoc);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to update profile" });
+      }
+    });
+
+    // Delete All User Data (Transactions, Budgets, Books, Debts, Categories)
+    app.delete("/users/data", async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (!email) return res.status(400).send({ error: "Email is required" });
+
+        const userEmail = email.trim();
+
+        // Delete user specific documents across all collections
+        await transactionsCollection.deleteMany({ userEmail });
+        await budgetsCollection.deleteMany({ userEmail });
+        await booksCollection.deleteMany({ "createdBy.email": userEmail });
+        await debtsCollection.deleteMany({ userEmail });
+        await categoriesCollection.deleteMany({
+          userEmail,
+          isDefault: { $ne: true },
+        });
+
+        res.send({
+          success: true,
+          message: "All user data deleted successfully",
+        });
+      } catch (error) {
+        res.status(500).send({ error: "Failed to delete user data" });
+      }
+    });
+    // ALL-IN-ONE BACKUP API (FETCH ALL USER DATA)
+    app.get("/backup/all", async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) {
+          return res.status(400).send({ error: "Email parameter is required" });
+        }
+
+        const userEmail = email.trim();
+
+        // Fetch user specific data across all collections
+        const books = await booksCollection
+          .find({ "createdBy.email": userEmail })
+          .toArray();
+        const budgets = await budgetsCollection.find({ userEmail }).toArray();
+        const debts = await debtsCollection.find({ userEmail }).toArray();
+        const transactions = await transactionsCollection
+          .find({ userEmail })
+          .toArray();
+        const categories = await categoriesCollection
+          .find({ userEmail })
+          .toArray();
+        const profile = await usersCollection.findOne({ email: userEmail });
+
+        // Package everything into a single Object
+        const backupPayload = {
+          userEmail,
+          backupDate: new Date(),
+          data: {
+            books,
+            budgets,
+            debts,
+            transactions,
+            categories,
+            profile,
+          },
+        };
+
+        res.send(backupPayload);
+      } catch (error) {
+        console.error("Backup All Data Error:", error);
+        res
+          .status(500)
+          .send({ error: "Failed to generate full system backup" });
+      }
+    });
+
+    // ALL-IN-ONE RESTORE API (INSERT ALL USER DATA)
+
+    app.post("/backup/restore-all", async (req, res) => {
+      try {
+        const { email, backupData } = req.body;
+
+        if (!email || !backupData || !backupData.data) {
+          return res
+            .status(400)
+            .send({ error: "Invalid backup dataset provided" });
+        }
+
+        const userEmail = email.trim();
+        const { books, budgets, debts, transactions, categories } =
+          backupData.data;
+
+        // Helper function to remove old MongoDB _id
+        const stripId = (items) => {
+          if (!Array.isArray(items)) return [];
+          return items.map((item) => {
+            const { _id, ...rest } = item;
+            return { ...rest, restoredAt: new Date() };
+          });
+        };
+
+        // 1. CLEANUP existing records for this user
+        await transactionsCollection.deleteMany({ userEmail });
+        await budgetsCollection.deleteMany({ userEmail });
+        await debtsCollection.deleteMany({ userEmail });
+        await booksCollection.deleteMany({ "createdBy.email": userEmail });
+        await categoriesCollection.deleteMany({ userEmail });
+
+        // 2. INSERT Restored Collections
+        const cleanBooks = stripId(books);
+        const cleanBudgets = stripId(budgets);
+        const cleanDebts = stripId(debts);
+        const cleanTransactions = stripId(transactions);
+        const cleanCategories = stripId(categories);
+
+        if (cleanBooks.length > 0) await booksCollection.insertMany(cleanBooks);
+        if (cleanBudgets.length > 0)
+          await budgetsCollection.insertMany(cleanBudgets);
+        if (cleanDebts.length > 0) await debtsCollection.insertMany(cleanDebts);
+        if (cleanTransactions.length > 0)
+          await transactionsCollection.insertMany(cleanTransactions);
+        if (cleanCategories.length > 0)
+          await categoriesCollection.insertMany(cleanCategories);
+
+        res.send({
+          success: true,
+          message:
+            "All data (Books, Budgets, Debts, Transactions, Categories) restored successfully!",
+        });
+      } catch (error) {
+        console.error("Full System Restore Error:", error);
+        res
+          .status(500)
+          .send({ error: "Failed to perform full system restore" });
+      }
+    });
+
     // --------------------=--------------------
     //      Books Database with API
     //---------------------=-------------------
@@ -138,7 +313,40 @@ async function run() {
     app.post("/books", async (req, res) => {
       try {
         const bookData = req.body;
-        const result = await booksCollection.insertOne(bookData);
+
+        const openingBalanceNum = parseFloat(bookData.openingBalance || 0);
+
+        // Prepare Book document with updated totals
+        const newBook = {
+          ...bookData,
+          openingBalance: openingBalanceNum,
+          currentBalance: openingBalanceNum,
+          totalIncome: openingBalanceNum, // Opening Balance counts as initial income
+          totalExpense: 0,
+          createdAt: bookData.createdAt || new Date().toISOString(),
+        };
+        // Insert Book into Books Collection
+        const result = await booksCollection.insertOne(newBook);
+        const bookId = result.insertedId;
+
+        // If Opening Balance is greater than 0, create an initial transaction entry
+        if (openingBalanceNum > 0) {
+          const initialTransaction = {
+            bookId: bookId.toString(),
+            amount: openingBalanceNum,
+            type: "CASH_IN",
+            title: "Opening Balance",
+            note: "Initial book balance",
+            category: "General", // Default Category
+            date: newBook.createdAt,
+            createdAt: newBook.createdAt,
+            userEmail: bookData.createdBy?.email || "",
+            isOpeningBalance: true, // Marker flag for future filtering/identification if needed
+          };
+
+          await transactionsCollection.insertOne(initialTransaction);
+        }
+
         res.send(result);
       } catch (error) {
         res.status(500).send({ error: "Failed to insert book data" });
@@ -194,15 +402,230 @@ async function run() {
     app.get("/categories", async (req, res) => {
       try {
         const email = req.query.email;
-        let query = { $or: [{ isDefault: true }, { userEmail: email }] };
+        let query = { isDefault: true };
 
         if (email) {
-          query = { userEmail: email.trim() };
+          query = {
+            $or: [{ isDefault: true }, { userEmail: email }],
+          };
         }
         const result = await categoriesCollection.find(query).toArray();
         res.send(result);
       } catch (error) {
         res.status(500).send({ error: "Failed to fetch books" });
+      }
+    });
+
+    // --------------------=--------------------
+    //      Reminder Database with API
+    //---------------------=-------------------
+
+    // 1. Get all reminders for a specific user
+    app.get("/reminders", async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) {
+          return res
+            .status(400)
+            .send({ error: "Email query parameter is required" });
+        }
+
+        const query = { userEmail: email.trim() };
+        const result = await remindersCollection
+          .find(query)
+          .sort({ nextDueDate: 1 })
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        console.error("Fetch Reminders Error:", error);
+        res.status(500).send({ error: "Failed to fetch reminders" });
+      }
+    });
+
+    // 2. Get single reminder details by ID
+    app.get("/reminders/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+        const reminder = await remindersCollection.findOne(query);
+
+        if (!reminder) {
+          return res.status(404).send({ message: "Reminder not found" });
+        }
+
+        res.send(reminder);
+      } catch (error) {
+        console.error("Fetch Single Reminder Error:", error);
+        res.status(500).send({ error: "Failed to fetch reminder" });
+      }
+    });
+
+    // 3. Create a new recurring reminder
+    app.post("/reminders", async (req, res) => {
+      try {
+        const reminderData = req.body;
+
+        const newReminder = {
+          ...reminderData,
+          amount: parseFloat(reminderData.amount),
+          status: reminderData.status || "active",
+          createdAt: new Date(),
+        };
+
+        const result = await remindersCollection.insertOne(newReminder);
+        res.send(result);
+      } catch (error) {
+        console.error("Create Reminder Error:", error);
+        res.status(500).send({ error: "Failed to create reminder" });
+      }
+    });
+
+    // 4. Process Payment for a Reminder (Creates Transaction, Updates Book Balance & Calculates Next Due Date)
+    app.post("/reminders/process-payment", async (req, res) => {
+      try {
+        const { id, email } = req.body;
+        if (!id || !email) {
+          return res
+            .status(400)
+            .send({ error: "Reminder ID and user email are required" });
+        }
+
+        const reminder = await remindersCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!reminder) {
+          return res.status(404).send({ error: "Reminder not found" });
+        }
+
+        const amount = parseFloat(reminder.amount);
+        const isExpense =
+          reminder.type === "EXPENSE" || reminder.type === "CASH_OUT";
+        const transactionType = isExpense ? "CASH_OUT" : "CASH_IN";
+
+        // Step A: Insert record into transactionsDB
+        const transactionDoc = {
+          userEmail: email.trim(),
+          bookId: reminder.bookId,
+          title: reminder.title,
+          amount: amount,
+          type: transactionType,
+          category: reminder.category,
+          date: new Date().toISOString(),
+          note: `Recurring Payment: ${reminder.title}`,
+          isRecurring: true,
+          reminderId: reminder._id,
+          createdAt: new Date(),
+        };
+
+        const transactionResult =
+          await transactionsCollection.insertOne(transactionDoc);
+
+        // Step B: Update target Book current balance and income/expense stats
+        if (transactionResult.insertedId && reminder.bookId) {
+          let bookUpdate = {};
+          if (transactionType === "CASH_IN") {
+            bookUpdate = {
+              $inc: { currentBalance: amount, totalIncome: amount },
+            };
+          } else {
+            bookUpdate = {
+              $inc: { currentBalance: -amount, totalExpense: amount },
+            };
+          }
+
+          await booksCollection.updateOne(
+            { _id: new ObjectId(reminder.bookId) },
+            bookUpdate,
+          );
+        }
+
+        // Step C: Calculate Next Due Date based on frequency
+        const currentNextDue = new Date(reminder.nextDueDate || Date.now());
+        let updatedNextDue = new Date(currentNextDue);
+
+        switch (reminder.frequency?.toLowerCase()) {
+          case "daily":
+            updatedNextDue.setDate(updatedNextDue.getDate() + 1);
+            break;
+          case "weekly":
+            updatedNextDue.setDate(updatedNextDue.getDate() + 7);
+            break;
+          case "yearly":
+            updatedNextDue.setFullYear(updatedNextDue.getFullYear() + 1);
+            break;
+          case "monthly":
+          default:
+            updatedNextDue.setMonth(updatedNextDue.getMonth() + 1);
+            break;
+        }
+
+        // Step D: Update Reminder with next due date and last payment timestamp
+        const reminderUpdateResult = await remindersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              nextDueDate: updatedNextDue.toISOString().split("T")[0],
+              lastProcessedAt: new Date(),
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        res.send({
+          success: true,
+          message:
+            "Payment processed, transaction saved, and next due date updated!",
+          transactionId: transactionResult.insertedId,
+          nextDueDate: updatedNextDue,
+        });
+      } catch (error) {
+        console.error("Process Reminder Payment Error:", error);
+        res.status(500).send({ error: "Failed to process reminder payment" });
+      }
+    });
+
+    // 5. Update reminder details
+    app.patch("/reminders/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const filter = { _id: new ObjectId(id) };
+        const updatedData = req.body;
+
+        if (updatedData.amount) {
+          updatedData.amount = parseFloat(updatedData.amount);
+        }
+
+        const updateDoc = {
+          $set: {
+            ...updatedData,
+            updatedAt: new Date(),
+          },
+        };
+
+        const result = await remindersCollection.updateOne(filter, updateDoc);
+        res.send(result);
+      } catch (error) {
+        console.error("Update Reminder Error:", error);
+        res.status(500).send({ error: "Failed to update reminder" });
+      }
+    });
+
+    // Delete reminder
+    app.delete("/reminders/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+        const result = await remindersCollection.deleteOne(query);
+
+        if (result.deletedCount === 0) {
+          return res.status(404).send({ message: "Reminder not found" });
+        }
+
+        res.send(result);
+      } catch (error) {
+        console.error("Delete Reminder Error:", error);
+        res.status(500).send({ error: "Failed to delete reminder" });
       }
     });
 
@@ -213,56 +636,174 @@ async function run() {
     // app.post("/transactions", async (req, res) => {
     //   try {
     //     const transactionData = req.body;
-    //     const result = await transactionsCollection.insertOne(transactionData);
-    //     res.send(result);
-    //   } catch (error) {
-    //     res.status(500).send({ error: "Failed to insert transaction" });
-    //   }
-    // });
-    // app.post("/transactions", async (req, res) => {
-    //   try {
-    //     const transactionData = req.body;
 
-    //     const result = await transactionsCollection.insertOne(transactionData);
+    //     // Handle transfer between two books
+    //     if (transactionData.type === "TRANSFER") {
+    //       const { sourceBookId, destinationBookId } =
+    //         transactionData.transferDetails || {};
+    //       const amount = parseFloat(transactionData.amount);
+    //       const transferPairId =
+    //         transactionData.transferDetails.transferPairId ||
+    //         `TP-${Date.now()}`;
 
-    //     // code for update balance in books
+    //       // Debit record for source book
+    //       const sourceTransaction = {
+    //         ...transactionData,
+    //         bookId: sourceBookId,
+    //         type: "TRANSFER",
+    //         transferType: "OUT",
+    //         transferDetails: {
+    //           transferPairId,
+    //           sourceBookId,
+    //           destinationBookId,
+    //         },
+    //       };
+
+    //       // Credit record for destination book
+    //       const destinationTransaction = {
+    //         ...transactionData,
+    //         bookId: destinationBookId,
+    //         type: "TRANSFER",
+    //         transferType: "IN",
+    //         transferDetails: {
+    //           transferPairId,
+    //           sourceBookId,
+    //           destinationBookId,
+    //         },
+    //       };
+
+    //       // Store both transaction entries at once
+    //       const result = await transactionsCollection.insertMany([
+    //         sourceTransaction,
+    //         destinationTransaction,
+    //       ]);
+
+    //       // Deduct balance from source book
+    //       await booksCollection.updateOne(
+    //         { _id: new ObjectId(sourceBookId) },
+    //         { $inc: { currentBalance: -amount } },
+    //       );
+
+    //       // Add balance to destination book
+    //       await booksCollection.updateOne(
+    //         { _id: new ObjectId(destinationBookId) },
+    //         { $inc: { currentBalance: amount } },
+    //       );
+
+    //       return res.send({
+    //         acknowledged: true,
+    //         insertedId: result.insertedIds[0],
+    //         insertedCount: result.insertedCount,
+    //       });
+    //     }
+
+    //     // Handle standard income/expense transactions
+    //     const result = await transactionsCollection.insertOne(transactionData);
     //     if (result.insertedId) {
     //       const amount = parseFloat(transactionData.amount);
-    //       const bookId = transactionData.bookId;
-
-    //       // transaction type to update or modify
-    //       let bookUpdate = {};
 
     //       if (transactionData.type === "CASH_IN") {
-    //         bookUpdate = {
-    //           $inc: {
-    //             currentBalance: amount,
-    //             totalIncome: amount,
-    //           },
-    //         };
+    //         await booksCollection.updateOne(
+    //           { _id: new ObjectId(transactionData.bookId) },
+    //           { $inc: { currentBalance: amount, totalIncome: amount } },
+    //         );
     //       } else if (transactionData.type === "CASH_OUT") {
-    //         bookUpdate = {
-    //           $inc: {
-    //             currentBalance: -amount,
-    //             totalExpense: amount,
-    //           },
-    //         };
+    //         await booksCollection.updateOne(
+    //           { _id: new ObjectId(transactionData.bookId) },
+    //           { $inc: { currentBalance: -amount, totalExpense: amount } },
+    //         );
     //       }
-    //       // books update in DB
-    //       await booksCollection.updateOne(
-    //         { _id: new ObjectId(bookId) },
-    //         bookUpdate,
-    //       );
     //     }
 
     //     res.send(result);
     //   } catch (error) {
+    //     console.error("Transaction Creation Error:", error);
     //     res.status(500).send({ error: "Failed to insert transaction" });
     //   }
     // });
+
     app.post("/transactions", async (req, res) => {
       try {
         const transactionData = req.body;
+
+        // Handle Transfer between two books
+        if (transactionData.type === "TRANSFER") {
+          const { sourceBookId, destinationBookId } =
+            transactionData.transferDetails || {};
+
+          if (!sourceBookId || !destinationBookId) {
+            return res
+              .status(400)
+              .send({ error: "Source and Destination books are required" });
+          }
+
+          const amount = parseFloat(transactionData.amount);
+          const transferPairId =
+            transactionData.transferDetails.transferPairId ||
+            `TP-${Date.now()}`;
+
+          // Debit record for source book (OUT)
+          const sourceTransaction = {
+            ...transactionData,
+            bookId: sourceBookId,
+            type: "TRANSFER",
+            transferType: "OUT",
+            transferDetails: {
+              transferPairId,
+              sourceBookId,
+              destinationBookId,
+            },
+          };
+
+          // Credit record for destination book (IN)
+          const destinationTransaction = {
+            ...transactionData,
+            bookId: destinationBookId,
+            type: "TRANSFER",
+            transferType: "IN",
+            transferDetails: {
+              transferPairId,
+              sourceBookId,
+              destinationBookId,
+            },
+          };
+
+          // Store both transaction entries in database
+          const result = await transactionsCollection.insertMany([
+            sourceTransaction,
+            destinationTransaction,
+          ]);
+
+          // Deduct balance and INCREASE totalExpense for Source Book
+          await booksCollection.updateOne(
+            { _id: new ObjectId(sourceBookId) },
+            {
+              $inc: {
+                currentBalance: -amount,
+                totalExpense: amount, // <-- Added totalExpense update
+              },
+            },
+          );
+
+          // Add balance and INCREASE totalIncome for Destination Book
+          await booksCollection.updateOne(
+            { _id: new ObjectId(destinationBookId) },
+            {
+              $inc: {
+                currentBalance: amount,
+                totalIncome: amount, // <-- Added totalIncome update
+              },
+            },
+          );
+
+          return res.send({
+            acknowledged: true,
+            insertedId: result.insertedIds[0],
+            insertedCount: result.insertedCount,
+          });
+        }
+
+        // Handle Standard Income/Expense Transactions (CASH_IN / CASH_OUT)
         const result = await transactionsCollection.insertOne(transactionData);
 
         if (result.insertedId) {
@@ -278,21 +819,6 @@ async function run() {
               { _id: new ObjectId(transactionData.bookId) },
               { $inc: { currentBalance: -amount, totalExpense: amount } },
             );
-          } else if (transactionData.type === "TRANSFER") {
-            const { sourceBookId, destinationBookId } =
-              transactionData.transferDetails;
-
-            // Source Book balance deduction
-            await booksCollection.updateOne(
-              { _id: new ObjectId(sourceBookId) },
-              { $inc: { currentBalance: -amount } },
-            );
-
-            // Destination Book balance addition
-            await booksCollection.updateOne(
-              { _id: new ObjectId(destinationBookId) },
-              { $inc: { currentBalance: amount } },
-            );
           }
         }
 
@@ -305,29 +831,14 @@ async function run() {
 
     app.get("/transactions", async (req, res) => {
       try {
-        const { email, type, bookId } = req.query;
-        let query = {};
+        const { email } = req.query;
+        if (!email) return res.status(400).send({ error: "Email is required" });
 
-        if (email) {
-          query = { userEmail: email.trim() };
-        }
-        if (type) {
-          query.type = type;
-        }
-        // Check both main bookId and destinationBookId inside transferDetails
-        if (bookId) {
-          // query.bookId = bookId;
-          query.$or = [
-            { bookId: bookId },
-            { "transferDetails.destinationBookId": bookId },
-          ];
-        }
-
-        const result = await transactionsCollection
+        const transactions = await transactionsCollection
           .aggregate([
-            { $match: query },
-            { $sort: { date: -1 } },
-            // Safe Object ID conversion for Book
+            { $match: { userEmail: email } },
+
+            // 1. Convert string bookId to ObjectId safely
             {
               $addFields: {
                 convertedBookId: {
@@ -336,27 +847,17 @@ async function run() {
                       $and: [
                         { $ne: ["$bookId", null] },
                         { $ne: ["$bookId", ""] },
+                        { $eq: [{ $strLenCP: { $toString: "$bookId" } }, 24] },
                       ],
                     },
                     { $toObjectId: "$bookId" },
                     null,
                   ],
                 },
-                convertedCategoryId: {
-                  $cond: [
-                    {
-                      $and: [
-                        { $ne: ["$categoryId", null] },
-                        { $ne: ["$categoryId", ""] },
-                      ],
-                    },
-                    { $toObjectId: "$categoryId" },
-                    null,
-                  ],
-                },
               },
             },
-            // Lookup Book Details
+
+            // 2. Lookup from books collection
             {
               $lookup: {
                 from: "booksDB",
@@ -371,45 +872,32 @@ async function run() {
                 preserveNullAndEmptyArrays: true,
               },
             },
-            // Lookup Category Details
+
+            // 3. Add bookName & bookIcon fields
             {
-              $lookup: {
-                from: "categoriesDB",
-                localField: "convertedCategoryId",
-                foreignField: "_id",
-                as: "categoryDetails",
+              $addFields: {
+                bookName: {
+                  $ifNull: ["$bookDetails.bookName", "Unknown Book"],
+                },
+                bookIcon: { $ifNull: ["$bookDetails.icon", "wallet"] },
+                bookColor: { $ifNull: ["$bookDetails.themeColor", "#2E6F40"] },
               },
             },
-            {
-              $unwind: {
-                path: "$categoryDetails",
-                preserveNullAndEmptyArrays: true,
-              },
-            },
-            // Only Keep Required & Important Fields
+
+            // 4. Clean up temporary fields
             {
               $project: {
-                _id: 1,
-                amount: 1,
-                bookId: 1,
-                type: 1,
-                date: 1,
-                note: 1,
-                categoryId: 1,
-                userEmail: 1,
-                transferDetails: 1,
-                bookDetails: {
-                  name: "$bookDetails.bookName",
-                  icon: "$bookDetails.icon",
-                  color: "$bookDetails.themeColor",
-                },
+                bookDetails: 0,
+                convertedBookId: 0,
               },
             },
+            { $sort: { createdAt: -1 } },
           ])
           .toArray();
 
-        res.send(result);
+        res.send(transactions);
       } catch (error) {
+        console.error("Error fetching transactions:", error);
         res.status(500).send({ error: "Failed to fetch transactions" });
       }
     });
@@ -535,6 +1023,90 @@ async function run() {
       }
     });
 
+    // --------------------=--------------------
+    //      Lent and Borrowed Database with API
+    // --------------------=--------------------
+    app.post("/debts", async (req, res) => {
+      try {
+        const debtData = req.body;
+
+        const result = await debtsCollection.insertOne(debtData);
+
+        res.send(result);
+      } catch (error) {
+        console.error("Create Debt Error:", error);
+        res.status(500).send({ error: "Failed to create debt record" });
+      }
+    });
+
+    app.get("/debts", async (req, res) => {
+      try {
+        const { email, userId, type, status, bookId } = req.query;
+        let query = {};
+
+        if (email) query.userEmail = email.trim();
+        if (userId) query.userId = userId;
+        if (type) query.type = type;
+        if (status) query.status = status;
+        if (bookId) query.bookId = bookId;
+
+        const result = await debtsCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: "Failed to fetch debt records" });
+      }
+    });
+
+    app.patch("/debts/settle/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { amount, note } = req.body;
+        const filter = { _id: new ObjectId(id) };
+
+        const debt = await debtsCollection.findOne(filter);
+        if (!debt) {
+          return res.status(404).send({ error: "Debt record not found" });
+        }
+
+        const currentBalance = Number(debt.remainingBalance) || 0;
+        const paymentAmount = Number(amount) || currentBalance;
+        const newRemainingBalance = Math.max(0, currentBalance - paymentAmount);
+
+        // Status update: balance 0 hole 'PAID', na hole 'PARTIAL'
+        const newStatus = newRemainingBalance === 0 ? "PAID" : "PARTIAL";
+
+        const updateDoc = {
+          $set: {
+            remainingBalance: newRemainingBalance,
+            status: newStatus,
+            updatedAt: new Date(),
+          },
+          $push: {
+            settlements: {
+              amount: paymentAmount,
+              note: note || "Settlement Payment",
+              date: new Date(),
+            },
+          },
+        };
+
+        const result = await debtsCollection.updateOne(filter, updateDoc);
+        res.send({
+          success: true,
+          result,
+          remainingBalance: newRemainingBalance,
+          status: newStatus,
+        });
+      } catch (error) {
+        console.error("Settle Debt Error:", error);
+        res.status(500).send({ error: "Failed to settle debt record" });
+      }
+    });
+
     // =----------------------------------------
     // DASHBOARD SUMMARY API
     // =----------------------------------------
@@ -579,7 +1151,24 @@ async function run() {
 
         const netSavings = totalIncome - totalExpense;
 
-        // Categorized expenses
+        // Calculate Total Lent & Borrowed from debtsCollection
+        const debts = await debtsCollection
+          .find({ userEmail: userEmail })
+          .toArray();
+
+        let totalLent = 0;
+        let totalBorrowed = 0;
+
+        debts.forEach((debt) => {
+          const remainingAmount =
+            parseFloat(debt.remainingBalance) || parseFloat(debt.amount) || 0;
+          if (debt.type === "LENT") {
+            totalLent += remainingAmount;
+          } else if (debt.type === "BORROWED") {
+            totalBorrowed += remainingAmount;
+          }
+        });
+
         // Categorized expenses
         const categoryExpenses = await transactionsCollection
           .aggregate([
@@ -592,7 +1181,6 @@ async function run() {
             },
             {
               $addFields: {
-                // String categoryId কে ObjectId তে রূপান্তর
                 convertedCategoryId: { $toObjectId: "$categoryId" },
               },
             },
@@ -639,6 +1227,8 @@ async function run() {
             totalBudgeted,
             totalExpense,
             netSavings,
+            totalLent,
+            totalBorrowed,
           },
           categoryExpenses,
         });
@@ -715,6 +1305,43 @@ async function run() {
         const budgetOverview = await budgetsCollection
           .aggregate([
             { $match: { userEmail } },
+
+            // 1. Convert string bookId to ObjectId safely
+            {
+              $addFields: {
+                convertedBookId: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $ne: ["$bookId", null] },
+                        { $ne: ["$bookId", ""] },
+                        { $eq: [{ $strLenCP: { $toString: "$bookId" } }, 24] }, // Valid ObjectId check
+                      ],
+                    },
+                    { $toObjectId: "$bookId" },
+                    null,
+                  ],
+                },
+              },
+            },
+
+            // 2. Lookup Book Details (Make sure collection name is correct)
+            {
+              $lookup: {
+                from: "booksDB", // MongoDB-তে আসল collection name টি লিখুন (eg. books or booksDB)
+                localField: "convertedBookId",
+                foreignField: "_id",
+                as: "bookDetails",
+              },
+            },
+            {
+              $unwind: {
+                path: "$bookDetails",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+
+            // 3. Lookup Transactions for Category Spending
             {
               $lookup: {
                 from: "transactionsDB",
@@ -732,7 +1359,24 @@ async function run() {
                   },
                   {
                     $addFields: {
-                      convertedCategoryId: { $toObjectId: "$categoryId" },
+                      convertedCategoryId: {
+                        $cond: [
+                          {
+                            $and: [
+                              { $ne: ["$categoryId", null] },
+                              { $ne: ["$categoryId", ""] },
+                              {
+                                $eq: [
+                                  { $strLenCP: { $toString: "$categoryId" } },
+                                  24,
+                                ],
+                              },
+                            ],
+                          },
+                          { $toObjectId: "$categoryId" },
+                          null,
+                        ],
+                      },
                     },
                   },
                   {
@@ -759,6 +1403,8 @@ async function run() {
                 as: "spentData",
               },
             },
+
+            // 4. Final Projection
             {
               $project: {
                 _id: 1,
@@ -767,6 +1413,8 @@ async function run() {
                   $ifNull: [{ $arrayElemAt: ["$spentData.totalSpent", 0] }, 0],
                 },
                 total: { $toDouble: { $ifNull: ["$budgetAmount", 0] } },
+                bookId: { $ifNull: ["$bookId", null] },
+                bookName: { $ifNull: ["$bookDetails.bookName", "N/A"] },
               },
             },
           ])
@@ -774,16 +1422,14 @@ async function run() {
 
         res.send(budgetOverview);
       } catch (error) {
-        console.error(error);
+        console.error("Budget Overview Error:", error);
         res.status(500).send({ error: "Failed to calculate budget overview" });
       }
     });
-
     // --------------------=--------------------
     //      Reports Database with API
     // --------------------=--------------------
 
-    // Get Analytics Data filtered by Period (Daily, Weekly, Monthly, Yearly)
     app.get("/reports/analytics", async (req, res) => {
       try {
         const { email, period = "Monthly" } = req.query;
@@ -973,89 +1619,6 @@ async function run() {
       }
     });
 
-    // --------------------=--------------------
-    //      Lent and Borrowed Database with API
-    // --------------------=--------------------
-    app.post("/debts", async (req, res) => {
-      try {
-        const debtData = req.body;
-
-        const result = await debtsCollection.insertOne(debtData);
-
-        res.send(result);
-      } catch (error) {
-        console.error("Create Debt Error:", error);
-        res.status(500).send({ error: "Failed to create debt record" });
-      }
-    });
-    // Get All Debts (Filter by email/userId, type, status, or bookId)
-    app.get("/debts", async (req, res) => {
-      try {
-        const { email, userId, type, status, bookId } = req.query;
-        let query = {};
-
-        if (email) query.userEmail = email.trim();
-        if (userId) query.userId = userId;
-        if (type) query.type = type;
-        if (status) query.status = status;
-        if (bookId) query.bookId = bookId;
-
-        const result = await debtsCollection
-          .find(query)
-          .sort({ createdAt: -1 })
-          .toArray();
-
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ error: "Failed to fetch debt records" });
-      }
-    });
-
-    app.patch("/debts/settle/:id", async (req, res) => {
-      try {
-        const id = req.params.id;
-        const { amount, note } = req.body;
-        const filter = { _id: new ObjectId(id) };
-
-        const debt = await debtsCollection.findOne(filter);
-        if (!debt) {
-          return res.status(404).send({ error: "Debt record not found" });
-        }
-
-        const currentBalance = Number(debt.remainingBalance) || 0;
-        const paymentAmount = Number(amount) || currentBalance;
-        const newRemainingBalance = Math.max(0, currentBalance - paymentAmount);
-
-        // Status update: balance 0 hole 'PAID', na hole 'PARTIAL'
-        const newStatus = newRemainingBalance === 0 ? "PAID" : "PARTIAL";
-
-        const updateDoc = {
-          $set: {
-            remainingBalance: newRemainingBalance,
-            status: newStatus,
-            updatedAt: new Date(),
-          },
-          $push: {
-            settlements: {
-              amount: paymentAmount,
-              note: note || "Settlement Payment",
-              date: new Date(),
-            },
-          },
-        };
-
-        const result = await debtsCollection.updateOne(filter, updateDoc);
-        res.send({
-          success: true,
-          result,
-          remainingBalance: newRemainingBalance,
-          status: newStatus,
-        });
-      } catch (error) {
-        console.error("Settle Debt Error:", error);
-        res.status(500).send({ error: "Failed to settle debt record" });
-      }
-    });
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
