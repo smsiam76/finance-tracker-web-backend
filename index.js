@@ -117,27 +117,27 @@ async function run() {
     });
 
     // Update User Profile (Phone, Location, FullName)
-    app.patch("/users/profile", async (req, res) => {
-      try {
-        const { email, fullName, phone, location } = req.body;
-        if (!email) return res.status(400).send({ error: "Email is required" });
+    // app.patch("/users/profile", async (req, res) => {
+    //   try {
+    //     const { email, fullName, phone, location } = req.body;
+    //     if (!email) return res.status(400).send({ error: "Email is required" });
 
-        const filter = { email: email.trim() };
-        const updateDoc = {
-          $set: {
-            ...(fullName && { fullName }),
-            ...(phone && { phone }),
-            ...(location && { location }),
-            updatedAt: new Date(),
-          },
-        };
+    //     const filter = { email: email.trim() };
+    //     const updateDoc = {
+    //       $set: {
+    //         ...(fullName && { fullName }),
+    //         ...(phone && { phone }),
+    //         ...(location && { location }),
+    //         updatedAt: new Date(),
+    //       },
+    //     };
 
-        const result = await usersCollection.updateOne(filter, updateDoc);
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ error: "Failed to update profile" });
-      }
-    });
+    //     const result = await usersCollection.updateOne(filter, updateDoc);
+    //     res.send(result);
+    //   } catch (error) {
+    //     res.status(500).send({ error: "Failed to update profile" });
+    //   }
+    // });
 
     // Delete All User Data (Transactions, Budgets, Books, Debts, Categories)
     app.delete("/users/data", async (req, res) => {
@@ -163,113 +163,6 @@ async function run() {
         });
       } catch (error) {
         res.status(500).send({ error: "Failed to delete user data" });
-      }
-    });
-    // ALL-IN-ONE BACKUP API (FETCH ALL USER DATA)
-    app.get("/backup/all", async (req, res) => {
-      try {
-        const { email } = req.query;
-        if (!email) {
-          return res.status(400).send({ error: "Email parameter is required" });
-        }
-
-        const userEmail = email.trim();
-
-        // Fetch user specific data across all collections
-        const books = await booksCollection
-          .find({ "createdBy.email": userEmail })
-          .toArray();
-        const budgets = await budgetsCollection.find({ userEmail }).toArray();
-        const debts = await debtsCollection.find({ userEmail }).toArray();
-        const transactions = await transactionsCollection
-          .find({ userEmail })
-          .toArray();
-        const categories = await categoriesCollection
-          .find({ userEmail })
-          .toArray();
-        const profile = await usersCollection.findOne({ email: userEmail });
-
-        // Package everything into a single Object
-        const backupPayload = {
-          userEmail,
-          backupDate: new Date(),
-          data: {
-            books,
-            budgets,
-            debts,
-            transactions,
-            categories,
-            profile,
-          },
-        };
-
-        res.send(backupPayload);
-      } catch (error) {
-        console.error("Backup All Data Error:", error);
-        res
-          .status(500)
-          .send({ error: "Failed to generate full system backup" });
-      }
-    });
-
-    // ALL-IN-ONE RESTORE API (INSERT ALL USER DATA)
-
-    app.post("/backup/restore-all", async (req, res) => {
-      try {
-        const { email, backupData } = req.body;
-
-        if (!email || !backupData || !backupData.data) {
-          return res
-            .status(400)
-            .send({ error: "Invalid backup dataset provided" });
-        }
-
-        const userEmail = email.trim();
-        const { books, budgets, debts, transactions, categories } =
-          backupData.data;
-
-        // Helper function to remove old MongoDB _id
-        const stripId = (items) => {
-          if (!Array.isArray(items)) return [];
-          return items.map((item) => {
-            const { _id, ...rest } = item;
-            return { ...rest, restoredAt: new Date() };
-          });
-        };
-
-        // 1. CLEANUP existing records for this user
-        await transactionsCollection.deleteMany({ userEmail });
-        await budgetsCollection.deleteMany({ userEmail });
-        await debtsCollection.deleteMany({ userEmail });
-        await booksCollection.deleteMany({ "createdBy.email": userEmail });
-        await categoriesCollection.deleteMany({ userEmail });
-
-        // 2. INSERT Restored Collections
-        const cleanBooks = stripId(books);
-        const cleanBudgets = stripId(budgets);
-        const cleanDebts = stripId(debts);
-        const cleanTransactions = stripId(transactions);
-        const cleanCategories = stripId(categories);
-
-        if (cleanBooks.length > 0) await booksCollection.insertMany(cleanBooks);
-        if (cleanBudgets.length > 0)
-          await budgetsCollection.insertMany(cleanBudgets);
-        if (cleanDebts.length > 0) await debtsCollection.insertMany(cleanDebts);
-        if (cleanTransactions.length > 0)
-          await transactionsCollection.insertMany(cleanTransactions);
-        if (cleanCategories.length > 0)
-          await categoriesCollection.insertMany(cleanCategories);
-
-        res.send({
-          success: true,
-          message:
-            "All data (Books, Budgets, Debts, Transactions, Categories) restored successfully!",
-        });
-      } catch (error) {
-        console.error("Full System Restore Error:", error);
-        res
-          .status(500)
-          .send({ error: "Failed to perform full system restore" });
       }
     });
 
@@ -482,106 +375,75 @@ async function run() {
     });
 
     // 4. Process Payment for a Reminder (Creates Transaction, Updates Book Balance & Calculates Next Due Date)
-    app.post("/reminders/process-payment", async (req, res) => {
+    app.post("/reminders/:id/process", async (req, res) => {
+      const session = client.startSession();
       try {
-        const { id, email } = req.body;
-        if (!id || !email) {
-          return res
-            .status(400)
-            .send({ error: "Reminder ID and user email are required" });
-        }
+        session.startTransaction();
+        const id = req.params.id;
+        const { email } = req.body;
 
-        const reminder = await remindersCollection.findOne({
-          _id: new ObjectId(id),
-        });
+        // 1. Reminder Information 
+        const reminder = await remindersCollection.findOne(
+          { _id: new ObjectId(id) },
+          { session },
+        );
+
         if (!reminder) {
+          await session.abortTransaction();
           return res.status(404).send({ error: "Reminder not found" });
         }
 
-        const amount = parseFloat(reminder.amount);
-        const isExpense =
-          reminder.type === "EXPENSE" || reminder.type === "CASH_OUT";
-        const transactionType = isExpense ? "CASH_OUT" : "CASH_IN";
-
-        // Step A: Insert record into transactionsDB
-        const transactionDoc = {
-          userEmail: email.trim(),
-          bookId: reminder.bookId,
-          title: reminder.title,
-          amount: amount,
-          type: transactionType,
-          category: reminder.category,
-          date: new Date().toISOString(),
-          note: `Recurring Payment: ${reminder.title}`,
-          isRecurring: true,
-          reminderId: reminder._id,
-          createdAt: new Date(),
-        };
-
-        const transactionResult =
-          await transactionsCollection.insertOne(transactionDoc);
-
-        // Step B: Update target Book current balance and income/expense stats
-        if (transactionResult.insertedId && reminder.bookId) {
-          let bookUpdate = {};
-          if (transactionType === "CASH_IN") {
-            bookUpdate = {
-              $inc: { currentBalance: amount, totalIncome: amount },
-            };
-          } else {
-            bookUpdate = {
-              $inc: { currentBalance: -amount, totalExpense: amount },
-            };
-          }
-
-          await booksCollection.updateOne(
-            { _id: new ObjectId(reminder.bookId) },
-            bookUpdate,
-          );
-        }
-
-        // Step C: Calculate Next Due Date based on frequency
-        const currentNextDue = new Date(reminder.nextDueDate || Date.now());
-        let updatedNextDue = new Date(currentNextDue);
-
-        switch (reminder.frequency?.toLowerCase()) {
-          case "daily":
-            updatedNextDue.setDate(updatedNextDue.getDate() + 1);
-            break;
-          case "weekly":
-            updatedNextDue.setDate(updatedNextDue.getDate() + 7);
-            break;
-          case "yearly":
-            updatedNextDue.setFullYear(updatedNextDue.getFullYear() + 1);
-            break;
-          case "monthly":
-          default:
-            updatedNextDue.setMonth(updatedNextDue.getMonth() + 1);
-            break;
-        }
-
-        // Step D: Update Reminder with next due date and last payment timestamp
-        const reminderUpdateResult = await remindersCollection.updateOne(
+        // 2. Reminder Status "paid"
+        await remindersCollection.updateOne(
           { _id: new ObjectId(id) },
-          {
-            $set: {
-              nextDueDate: updatedNextDue.toISOString().split("T")[0],
-              lastProcessedAt: new Date(),
-              updatedAt: new Date(),
-            },
-          },
+          { $set: { status: "paid", updatedAt: new Date() } },
+          { session },
         );
 
+        // 
+        const transactionType =
+          reminder.type === "EXPENSE" ? "CASH_OUT" : "CASH_IN";
+
+        // 4. Make New Transaction 
+        const newTransaction = {
+          userId: reminder.userId || null,
+          userEmail: email || reminder.userEmail,
+          type: transactionType,
+          categoryId: reminder.category || null,
+          amount: parseFloat(reminder.amount),
+          date: new Date(),
+          note: `Paid for reminder: ${reminder.title}`,
+          bookId: reminder.bookId,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        await transactionsCollection.insertOne(newTransaction, { session });
+
+        // 5. Update Book Balance and Expense/Income  
+        const amount = parseFloat(reminder.amount);
+        const balanceUpdate =
+          transactionType === "CASH_IN"
+            ? { currentBalance: amount, totalIncome: amount }
+            : { currentBalance: -amount, totalExpense: amount };
+
+        await booksCollection.updateOne(
+          { _id: new ObjectId(reminder.bookId) },
+          { $inc: balanceUpdate },
+          { session },
+        );
+
+        await session.commitTransaction();
         res.send({
           success: true,
-          message:
-            "Payment processed, transaction saved, and next due date updated!",
-          transactionId: transactionResult.insertedId,
-          nextDueDate: updatedNextDue,
+          message: "Reminder paid and transaction recorded successfully",
         });
       } catch (error) {
-        console.error("Process Reminder Payment Error:", error);
-        res.status(500).send({ error: "Failed to process reminder payment" });
+        await session.abortTransaction();
+        console.error("Process Payment Error:", error);
+        res.status(500).send({ error: "Failed to process payment" });
+      } finally {
+        session.endSession();
       }
     });
 
@@ -632,95 +494,6 @@ async function run() {
     // --------------------=--------------------
     //      Transactions Database with API
     //---------------------=-------------------
-
-    // app.post("/transactions", async (req, res) => {
-    //   try {
-    //     const transactionData = req.body;
-
-    //     // Handle transfer between two books
-    //     if (transactionData.type === "TRANSFER") {
-    //       const { sourceBookId, destinationBookId } =
-    //         transactionData.transferDetails || {};
-    //       const amount = parseFloat(transactionData.amount);
-    //       const transferPairId =
-    //         transactionData.transferDetails.transferPairId ||
-    //         `TP-${Date.now()}`;
-
-    //       // Debit record for source book
-    //       const sourceTransaction = {
-    //         ...transactionData,
-    //         bookId: sourceBookId,
-    //         type: "TRANSFER",
-    //         transferType: "OUT",
-    //         transferDetails: {
-    //           transferPairId,
-    //           sourceBookId,
-    //           destinationBookId,
-    //         },
-    //       };
-
-    //       // Credit record for destination book
-    //       const destinationTransaction = {
-    //         ...transactionData,
-    //         bookId: destinationBookId,
-    //         type: "TRANSFER",
-    //         transferType: "IN",
-    //         transferDetails: {
-    //           transferPairId,
-    //           sourceBookId,
-    //           destinationBookId,
-    //         },
-    //       };
-
-    //       // Store both transaction entries at once
-    //       const result = await transactionsCollection.insertMany([
-    //         sourceTransaction,
-    //         destinationTransaction,
-    //       ]);
-
-    //       // Deduct balance from source book
-    //       await booksCollection.updateOne(
-    //         { _id: new ObjectId(sourceBookId) },
-    //         { $inc: { currentBalance: -amount } },
-    //       );
-
-    //       // Add balance to destination book
-    //       await booksCollection.updateOne(
-    //         { _id: new ObjectId(destinationBookId) },
-    //         { $inc: { currentBalance: amount } },
-    //       );
-
-    //       return res.send({
-    //         acknowledged: true,
-    //         insertedId: result.insertedIds[0],
-    //         insertedCount: result.insertedCount,
-    //       });
-    //     }
-
-    //     // Handle standard income/expense transactions
-    //     const result = await transactionsCollection.insertOne(transactionData);
-    //     if (result.insertedId) {
-    //       const amount = parseFloat(transactionData.amount);
-
-    //       if (transactionData.type === "CASH_IN") {
-    //         await booksCollection.updateOne(
-    //           { _id: new ObjectId(transactionData.bookId) },
-    //           { $inc: { currentBalance: amount, totalIncome: amount } },
-    //         );
-    //       } else if (transactionData.type === "CASH_OUT") {
-    //         await booksCollection.updateOne(
-    //           { _id: new ObjectId(transactionData.bookId) },
-    //           { $inc: { currentBalance: -amount, totalExpense: amount } },
-    //         );
-    //       }
-    //     }
-
-    //     res.send(result);
-    //   } catch (error) {
-    //     console.error("Transaction Creation Error:", error);
-    //     res.status(500).send({ error: "Failed to insert transaction" });
-    //   }
-    // });
 
     app.post("/transactions", async (req, res) => {
       try {
@@ -780,7 +553,8 @@ async function run() {
             {
               $inc: {
                 currentBalance: -amount,
-                totalExpense: amount, // <-- Added totalExpense update
+                totalIncome: -amount,
+                // totalExpense: amount, // <-- Added totalExpense update
               },
             },
           );
@@ -901,40 +675,7 @@ async function run() {
         res.status(500).send({ error: "Failed to fetch transactions" });
       }
     });
-    // app.get("/transactions", async (req, res) => {
-    //   try {
-    //     const { email, type, bookId } = req.query;
-    //     let query = {};
-
-    //     if (email) {
-    //       query = { userEmail: email.trim() };
-    //     }
-    //     if (type) {
-    //       query.type = type;
-    //     }
-    //     // Check both main bookId and destinationBookId inside transferDetails
-    //     if (bookId) {
-    //       // query.bookId = bookId;
-    //       query.$or = [
-    //         { bookId: bookId },
-    //         { "transferDetails.destinationBookId": bookId },
-    //       ];
-    //     }
-
-    //     const result = await transactionsCollection
-    //       .find(query)
-    //       .sort({ date: -1 })
-    //       .toArray();
-    //     res.send(result);
-    //   } catch (error) {
-    //     res.status(500).send({ error: "Failed to fetch transactions" });
-    //   }
-    // });
-
-    // --------------------=--------------------
-    //      Budgets Database with API
-    //---------------------=-------------------
-
+   
     app.post("/budgets", async (req, res) => {
       try {
         const budgetData = req.body;
@@ -1170,18 +911,93 @@ async function run() {
         });
 
         // Categorized expenses
+        // const categoryExpenses = await transactionsCollection
+        //   .aggregate([
+        //     {
+        //       $match: {
+        //         userEmail: userEmail,
+        //         type: "CASH_OUT",
+        //         categoryId: { $ne: null, $exists: true },
+        //       },
+        //     },
+        //     {
+        //       $addFields: {
+        //         convertedCategoryId: { $toObjectId: "$categoryId" },
+        //       },
+        //     },
+        //     {
+        //       $lookup: {
+        //         from: "categoriesDB",
+        //         localField: "convertedCategoryId",
+        //         foreignField: "_id",
+        //         as: "categoryDetails",
+        //       },
+        //     },
+        //     { $unwind: "$categoryDetails" },
+        //     {
+        //       $group: {
+        //         _id: "$categoryDetails.name",
+        //         amount: { $sum: { $toDouble: "$amount" } },
+        //         color: { $first: "$categoryDetails.color" },
+        //       },
+        //     },
+        //     {
+        //       $project: {
+        //         name: "$_id",
+        //         category: "$_id",
+        //         amount: 1,
+        //         color: 1,
+        //         _id: 0,
+        //       },
+        //     },
+        //   ])
+        //   .toArray();
+     
         const categoryExpenses = await transactionsCollection
           .aggregate([
             {
               $match: {
                 userEmail: userEmail,
                 type: "CASH_OUT",
-                categoryId: { $ne: null, $exists: true },
               },
             },
             {
               $addFields: {
-                convertedCategoryId: { $toObjectId: "$categoryId" },
+                convertedCategoryId: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $ne: ["$categoryId", null] },
+                        { $ne: ["$categoryId", ""] },
+                        {
+                          $eq: [
+                            { $strLenCP: { $toString: "$categoryId" } },
+                            24,
+                          ],
+                        },
+                      ],
+                    },
+                    { $toObjectId: "$categoryId" },
+                    null,
+                  ],
+                },
+                rawCategoryName: {
+                  $ifNull: [
+                    "$category",
+                    {
+                      $cond: [
+                        {
+                          $eq: [
+                            { $strLenCP: { $toString: "$categoryId" } },
+                            24,
+                          ],
+                        },
+                        null,
+                        "$categoryId",
+                      ],
+                    },
+                  ],
+                },
               },
             },
             {
@@ -1192,21 +1008,50 @@ async function run() {
                 as: "categoryDetails",
               },
             },
-            { $unwind: "$categoryDetails" },
+            {
+              $unwind: {
+                path: "$categoryDetails",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $addFields: {
+                finalCategoryName: {
+                  $ifNull: [
+                    "$categoryDetails.name",
+                    { $ifNull: ["$rawCategoryName", "General"] },
+                  ],
+                },
+                // 1. First preference: categoryDetails.color (DB lookup)
+                // 2. Second preference: transaction payload - color
+                // 3. Fallback: Dynamic color generation based on category name
+                finalCategoryColor: {
+                  $ifNull: [
+                    "$categoryDetails.color",
+                    {
+                      $ifNull: [
+                        "$color",
+                        "#3B82F6", // Vibrant default instead of dull gray
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
             {
               $group: {
-                _id: "$categoryDetails.name",
+                _id: "$finalCategoryName",
                 amount: { $sum: { $toDouble: "$amount" } },
-                color: { $first: "$categoryDetails.color" },
+                color: { $first: "$finalCategoryColor" },
               },
             },
             {
               $project: {
+                _id: 0,
                 name: "$_id",
                 category: "$_id",
                 amount: 1,
                 color: 1,
-                _id: 0,
               },
             },
           ])
@@ -1241,60 +1086,6 @@ async function run() {
     // =----------------------------------------
     // BUDGET VS EXPENSE OVERVIEW API (Optimized Aggregation)
     // =----------------------------------------
-    // app.get("/dashboard/budget-overview", async (req, res) => {
-    //   try {
-    //     const { email } = req.query;
-    //     if (!email) return res.status(400).send({ error: "Email is required" });
-    //     const userEmail = email.trim();
-
-    //     const budgetOverview = await budgetsCollection
-    //       .aggregate([
-    //         { $match: { userEmail } },
-    //         {
-    //           $lookup: {
-    //             from: "transactionsDB",
-    //             let: { catName: "$category", userEmail: "$userEmail" },
-    //             pipeline: [
-    //               {
-    //                 $match: {
-    //                   $expr: {
-    //                     $and: [
-    //                       { $eq: ["$userEmail", "$$userEmail"] },
-    //                       { $eq: ["$type", "CASH_OUT"] },
-    //                       { $eq: ["$category", "$$catName"] },
-    //                     ],
-    //                   },
-    //                 },
-    //               },
-    //               {
-    //                 $group: {
-    //                   _id: null,
-    //                   totalSpent: { $sum: { $toDouble: "$amount" } },
-    //                 },
-    //               },
-    //             ],
-    //             as: "spentData",
-    //           },
-    //         },
-    //         {
-    //           $project: {
-    //             _id: 1,
-    //             name: "$category",
-    //             spent: {
-    //               $ifNull: [{ $arrayElemAt: ["$spentData.totalSpent", 0] }, 0],
-    //             },
-    //             total: { $toDouble: { $ifNull: ["$budgetAmount", 0] } },
-    //           },
-    //         },
-    //       ])
-    //       .toArray();
-
-    //     res.send(budgetOverview);
-    //   } catch (error) {
-    //     console.error(error);
-    //     res.status(500).send({ error: "Failed to calculate budget overview" });
-    //   }
-    // });
 
     app.get("/dashboard/budget-overview", async (req, res) => {
       try {
@@ -1426,13 +1217,18 @@ async function run() {
         res.status(500).send({ error: "Failed to calculate budget overview" });
       }
     });
+
     // --------------------=--------------------
     //      Reports Database with API
     // --------------------=--------------------
 
     app.get("/reports/analytics", async (req, res) => {
       try {
-        const { email, period = "Monthly" } = req.query;
+        const {
+          email,
+          period = "Monthly",
+          selectedBook = "combined",
+        } = req.query;
 
         if (!email) {
           return res.status(400).send({ error: "Email is required" });
@@ -1442,7 +1238,6 @@ async function run() {
         const currentDate = new Date();
         let startDate = new Date();
 
-        // Date range setup according to period filter
         if (period === "Daily") {
           startDate.setHours(0, 0, 0, 0);
         } else if (period === "Weekly") {
@@ -1453,13 +1248,21 @@ async function run() {
           startDate.setFullYear(currentDate.getFullYear() - 1);
         }
 
-        // Match query for transactions within date range
+        // 1. Transaction Match Query
         const matchQuery = {
           userEmail,
           date: { $gte: startDate.toISOString() },
         };
 
-        // Calculate total income and total expense for selected period
+        if (
+          selectedBook &&
+          selectedBook !== "combined" &&
+          selectedBook !== "all"
+        ) {
+          matchQuery.bookId = selectedBook;
+        }
+
+        // Calculate Total Income & Expense
         const stats = await transactionsCollection
           .aggregate([
             { $match: matchQuery },
@@ -1480,15 +1283,35 @@ async function run() {
           if (item._id === "CASH_OUT") totalExpense = item.total;
         });
 
-        const currentBalance = totalIncome - totalExpense;
+        // 2. Fetch User Books
+        const userBooks = await booksCollection
+          .find({ "createdBy.email": userEmail })
+          .toArray();
 
-        // Balance Trend over time for Chart
+        let targetedBooks = userBooks;
+        if (
+          selectedBook &&
+          selectedBook !== "combined" &&
+          selectedBook !== "all" &&
+          selectedBook.length === 24
+        ) {
+          targetedBooks = userBooks.filter(
+            (b) => b._id.toString() === selectedBook,
+          );
+        }
+
+        const currentBalance = targetedBooks.reduce(
+          (sum, book) => sum + (parseFloat(book.currentBalance) || 0),
+          0,
+        );
+
+        // 3. Balance Trend aggregate query
         const balanceTrend = await transactionsCollection
           .aggregate([
             { $match: matchQuery },
             {
               $group: {
-                _id: { $substr: ["$date", 0, 10] }, // Format: YYYY-MM-DD
+                _id: { $substr: ["$date", 0, 10] },
                 totalIncome: {
                   $sum: {
                     $cond: [
@@ -1520,17 +1343,24 @@ async function run() {
           ])
           .toArray();
 
-        // Expenses grouped by Category for Pie Chart (UPDATED HERE)
+        // 4. Categorized Expenses Aggregate Query
+        const categoryExpensesMatch = {
+          userEmail,
+          type: "CASH_OUT",
+          date: { $gte: startDate.toISOString() },
+        };
+
+        if (
+          selectedBook &&
+          selectedBook !== "combined" &&
+          selectedBook !== "all"
+        ) {
+          categoryExpensesMatch.bookId = selectedBook;
+        }
+
         const categories = await transactionsCollection
           .aggregate([
-            {
-              $match: {
-                userEmail,
-                type: "CASH_OUT",
-                date: { $gte: startDate.toISOString() },
-                categoryId: { $ne: null, $exists: true, $ne: "" },
-              },
-            },
+            { $match: categoryExpensesMatch },
             {
               $addFields: {
                 convertedCategoryId: {
@@ -1539,11 +1369,20 @@ async function run() {
                       $and: [
                         { $ne: ["$categoryId", null] },
                         { $ne: ["$categoryId", ""] },
+                        {
+                          $eq: [
+                            { $strLenCP: { $toString: "$categoryId" } },
+                            24,
+                          ],
+                        },
                       ],
                     },
                     { $toObjectId: "$categoryId" },
                     null,
                   ],
+                },
+                rawCategoryName: {
+                  $ifNull: ["$category", "$categoryName"],
                 },
               },
             },
@@ -1555,12 +1394,30 @@ async function run() {
                 as: "cat",
               },
             },
-            { $unwind: { path: "$cat", preserveNullAndEmptyArrays: false } },
+            {
+              $unwind: {
+                path: "$cat",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $addFields: {
+                finalCategoryName: {
+                  $ifNull: [
+                    "$cat.name",
+                    { $ifNull: ["$rawCategoryName", "General"] },
+                  ],
+                },
+                finalColor: {
+                  $ifNull: ["$cat.color", { $ifNull: ["$color", "#10B981"] }],
+                },
+              },
+            },
             {
               $group: {
-                _id: "$cat.name",
+                _id: "$finalCategoryName",
                 value: { $sum: { $toDouble: "$amount" } },
-                color: { $first: "$cat.color" },
+                color: { $first: "$finalColor" },
               },
             },
             {
@@ -1579,43 +1436,225 @@ async function run() {
           totalIncome,
           totalExpense,
           currentBalance,
-          incomeGrowth: "+12.5%",
-          expenseGrowth: "-4.2%",
+          incomeGrowth: "+0%",
+          expenseGrowth: "-0%",
           balanceTrend,
           categories,
+          userBooks,
         });
       } catch (error) {
         console.error("Reports API Error:", error);
         res.status(500).send({ error: "Failed to fetch report analytics" });
       }
     });
+
     // 2. Get Overall Lifetime Metrics
-    app.get("/reports/overall", async (req, res) => {
+    // app.get("/reports/overall", async (req, res) => {
+    //   try {
+    //     const { email } = req.query;
+
+    //     if (!email) {
+    //       return res.status(400).send({ error: "Email is required" });
+    //     }
+
+    //     const userEmail = email.trim();
+
+    //     const overallStats = await transactionsCollection
+    //       .aggregate([
+    //         { $match: { userEmail } },
+    //         {
+    //           $group: {
+    //             _id: "$type",
+    //             totalAmount: { $sum: { $toDouble: "$amount" } },
+    //             totalCount: { $sum: 1 },
+    //           },
+    //         },
+    //       ])
+    //       .toArray();
+
+    //     res.send(overallStats);
+    //   } catch (error) {
+    //     res.status(500).send({ error: "Failed to fetch overall analytics" });
+    //   }
+    // });
+
+    // --------------------=--------------------
+    //    Backup Database with API
+    //---------------------=-------------------
+
+    // ALL-IN-ONE BACKUP API (FETCH ALL USER DATA)
+    app.get("/backup/all", async (req, res) => {
       try {
         const { email } = req.query;
-
         if (!email) {
-          return res.status(400).send({ error: "Email is required" });
+          return res.status(400).send({ error: "Email parameter is required" });
         }
 
         const userEmail = email.trim();
 
-        const overallStats = await transactionsCollection
-          .aggregate([
-            { $match: { userEmail } },
-            {
-              $group: {
-                _id: "$type",
-                totalAmount: { $sum: { $toDouble: "$amount" } },
-                totalCount: { $sum: 1 },
-              },
-            },
-          ])
+        // Fetch user specific data across all collections
+        const books = await booksCollection
+          .find({ "createdBy.email": userEmail })
+          .toArray();
+        const budgets = await budgetsCollection.find({ userEmail }).toArray();
+        const debts = await debtsCollection.find({ userEmail }).toArray();
+        const transactions = await transactionsCollection
+          .find({ userEmail })
+          .toArray();
+        const categories = await categoriesCollection
+          .find({ userEmail })
+          .toArray();
+        const profile = await usersCollection.findOne({ email: userEmail });
+
+        // Package everything into a single Object
+        const backupPayload = {
+          userEmail,
+          backupDate: new Date(),
+          data: {
+            books,
+            budgets,
+            debts,
+            transactions,
+            categories,
+            profile,
+          },
+        };
+
+        res.send(backupPayload);
+      } catch (error) {
+        console.error("Backup All Data Error:", error);
+        res
+          .status(500)
+          .send({ error: "Failed to generate full system backup" });
+      }
+    });
+
+    // ALL-IN-ONE RESTORE API (INSERT ALL USER DATA)
+    app.post("/backup/restore-all", async (req, res) => {
+      try {
+        const { email, backupData } = req.body;
+
+        if (!email || !backupData || !backupData.data) {
+          return res
+            .status(400)
+            .send({ error: "Invalid backup dataset provided" });
+        }
+
+        const userEmail = email.trim();
+        const { books, budgets, debts, transactions, categories } =
+          backupData.data;
+
+        // Helper function to remove old MongoDB _id
+        const stripId = (items) => {
+          if (!Array.isArray(items)) return [];
+          return items.map((item) => {
+            const { _id, ...rest } = item;
+            return { ...rest, restoredAt: new Date() };
+          });
+        };
+
+        // 1. CLEANUP existing records for this user
+        await transactionsCollection.deleteMany({ userEmail });
+        await budgetsCollection.deleteMany({ userEmail });
+        await debtsCollection.deleteMany({ userEmail });
+        await booksCollection.deleteMany({ "createdBy.email": userEmail });
+        await categoriesCollection.deleteMany({ userEmail });
+
+        // 2. INSERT Restored Collections
+        const cleanBooks = stripId(books);
+        const cleanBudgets = stripId(budgets);
+        const cleanDebts = stripId(debts);
+        const cleanTransactions = stripId(transactions);
+        const cleanCategories = stripId(categories);
+
+        if (cleanBooks.length > 0) await booksCollection.insertMany(cleanBooks);
+        if (cleanBudgets.length > 0)
+          await budgetsCollection.insertMany(cleanBudgets);
+        if (cleanDebts.length > 0) await debtsCollection.insertMany(cleanDebts);
+        if (cleanTransactions.length > 0)
+          await transactionsCollection.insertMany(cleanTransactions);
+        if (cleanCategories.length > 0)
+          await categoriesCollection.insertMany(cleanCategories);
+
+        res.send({
+          success: true,
+          message:
+            "All data (Books, Budgets, Debts, Transactions, Categories) restored successfully!",
+        });
+      } catch (error) {
+        console.error("Full System Restore Error:", error);
+        res
+          .status(500)
+          .send({ error: "Failed to perform full system restore" });
+      }
+    });
+
+    // --------------------=--------------------
+    //    Export Database with API
+    //---------------------=-------------------
+
+    // Export All User Data Route (Includes all collections)
+    app.get("/export/all-data", async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) {
+          return res.status(400).send({ message: "Email is required" });
+        }
+
+        const userEmail = email.trim();
+
+        // 1. Fetch all transactions for the user
+        const transactions = await transactionsCollection
+          .find({ userEmail })
+          .sort({ date: -1 })
           .toArray();
 
-        res.send(overallStats);
+        // 2. Fetch all books/ledgers associated with the user
+        const books = await booksCollection
+          .find({
+            $or: [{ "createdBy.email": userEmail }, { userEmail: userEmail }],
+          })
+          .toArray();
+
+        // 3. Fetch default categories as well as user-created custom categories
+        const categories = await categoriesCollection
+          .find({
+            $or: [{ isDefault: true }, { userEmail: userEmail }],
+          })
+          .toArray();
+
+        // 4. Fetch user budget limits
+        const budgets = await budgetsCollection.find({ userEmail }).toArray();
+
+        // 5. Fetch debt records (Lent & Borrowed)
+        const debts = await debtsCollection
+          .find({ userEmail })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        // 6. Fetch recurring bill reminders
+        const reminders = await remindersCollection
+          .find({ userEmail })
+          .toArray();
+
+        // 7. Fetch user profile info (Excluding sensitive data if any)
+        const profile = await usersCollection.findOne(
+          { email: userEmail },
+          { projection: { password: 0 } },
+        );
+
+        res.send({
+          transactions,
+          books,
+          categories,
+          budgets,
+          debts,
+          reminders,
+          profile: profile || {},
+        });
       } catch (error) {
-        res.status(500).send({ error: "Failed to fetch overall analytics" });
+        console.error("Export Error:", error);
+        res.status(500).send({ message: "Failed to fetch export data" });
       }
     });
 
